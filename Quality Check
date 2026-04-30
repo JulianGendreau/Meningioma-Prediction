@@ -1,0 +1,89 @@
+import os
+import numpy as np
+import nibabel as nib
+from tqdm import tqdm
+
+nifti_root = r"C:\Users\julia\OneDrive\Desktop\HG Meningioma Imaging\nifti_aligned"
+
+def check_nifti(path):
+    """Load a NIfTI file and return (ok, message, shape, stats)."""
+    if not os.path.exists(path):
+        return False, "File missing", None, None
+
+    try:
+        img = nib.load(path)
+        arr = img.get_fdata().astype(np.float32)
+    except Exception as e:
+        return False, f"Load error: {e}", None, None
+
+    if np.isnan(arr).any():
+        return False, "Contains NaN values", arr.shape, None
+
+    if np.isinf(arr).any():
+        return False, "Contains Inf values", arr.shape, None
+
+    if arr.std() == 0:
+        return False, "Zero-variance volume (flat image)", arr.shape, None
+
+    stats = {
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mean": float(arr.mean()),
+        "std": float(arr.std())
+    }
+
+    return True, "OK", arr.shape, stats
+
+
+bad_cases = []
+
+print("\n==================== NIFTI QUALITY CHECK ====================\n")
+
+for mrn in tqdm(os.listdir(nifti_root), desc="Checking patients"):
+    patient_dir = os.path.join(nifti_root, mrn)
+    if not os.path.isdir(patient_dir):
+        continue
+
+    t1_path = os.path.join(patient_dir, "t1.nii.gz")
+    t2_path = os.path.join(patient_dir, "t2_aligned.nii.gz")
+
+    print(f"\n--- MRN: {mrn} ---")
+
+    # Check T1
+    ok1, msg1, shape1, stats1 = check_nifti(t1_path)
+    print(f"T1: {msg1}")
+    if ok1:
+        print(f"    Shape: {shape1}")
+        print(f"    Stats: {stats1}")
+
+    # Check T2
+    ok2, msg2, shape2, stats2 = check_nifti(t2_path)
+    print(f"T2: {msg2}")
+    if ok2:
+        print(f"    Shape: {shape2}")
+        print(f"    Stats: {stats2}")
+
+    # Shape consistency
+    if ok1 and ok2:
+        if shape1 != shape2:
+            print("❌ Shape mismatch between T1 and T2")
+            bad_cases.append((mrn, "Shape mismatch"))
+        else:
+            print("✔ Shapes match")
+
+    # Record failures
+    if not ok1:
+        bad_cases.append((mrn, f"T1 issue: {msg1}"))
+    if not ok2:
+        bad_cases.append((mrn, f"T2 issue: {msg2}"))
+
+print("\n==================== SUMMARY ====================\n")
+
+if len(bad_cases) == 0:
+    print("🎉 All NIfTI files passed quality checks.")
+else:
+    print("⚠ The following MRNs have issues:")
+    for mrn, issue in bad_cases:
+        print(f" - {mrn}: {issue}")
+
+print("\n=================================================\n")
