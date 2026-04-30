@@ -1,0 +1,566 @@
+"""
+DeepSurv-style 3D CNN + clinical survival model
+with 5-fold CV, out-of-fold predictions, Kaplan–Meier curves,
+and 3-plane MRI visualization for the first patient.
+
+Requirements:
+    pip install numpy pandas nibabel torch monai lifelines matplotlib seaborn openpyxl
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import nibabel as nib
+from tqdm import tqdm
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from monai.networks.nets import EfficientNetBN
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from lifelines import KaplanMeierFitter
+
+sns.set_theme(style="whitegrid", font_scale=1.4)
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+excel_path = r"C:\Users\julia\OneDrive\Desktop\HG Meningioma Imaging\HGMeningiomaImaging.xlsx"
+nifti_root = r"C:\Users\julia\OneDrive\Desktop\HG Meningioma Imaging\nifti_aligned"
+
+mrn_col = "mrn"
+clinical_cols = ["age", "sex", "grade"]
+time_col = "time_to_event"
+event_col = "event"
+grade_col = "grade"
+
+target_depth = 128
+target_height = 128
+target_width = 128
+
+batch_size = 4
+num_epochs = 40
+learning_rate = 1e-4
+weight_decay = 1e-4
+n_splits = 5
+random_seed = 42
+patience = 6
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# -----------------------------
+# NIFTI LOADING + RESIZING
+# -----------------------------
+def load_nifti(path):
+    img = nib.load(path)
+    arr = img.get_fdata().astype(np.float32)
+    std = arr.std()
+    if std == 0:
+        std = 1.0
+    arr = (arr - arr.mean()) / std
+    return arr
+
+
+def resize_volume(vol, D, H, W):
+    d, h, w = vol.shape
+
+    # depth
+    if d > D:
+        start = (d - D) // 2
+        vol = vol[start:start + D]
+    else:
+        pad = D - d
+        vol = np.pad(vol, ((pad // 2, pad - pad // 2), (0, 0), (0, 0)))
+
+    # height
+    if h > H:
+        start = (h - H) // 2
+        vol = vol[:, start:start + H, :]
+    else:
+        pad = H - h
+        vol = np.pad(vol, ((0, 0), (pad // 2, pad - pad // 2), (0, 0)))
+
+    # width
+    if w > W:
+        start = (w - W) // 2
+        vol = vol[:, :, start:start + W]
+    else:
+        pad = W - w
+        vol = np.pad(vol, ((0, 0), (0, 0), (pad // 2, pad - pad // 2)))
+
+    return vol
+
+
+# -----------------------------
+# DATASET
+# -----------------------------
+class MeningiomaSurvivalDataset(Dataset):
+    """
+    Returns:
+        img: (1, D, H, W)
+        clin: (len(clinical_cols),)
+        time: scalar
+        event: scalar
+    """
+    def __init__(self, df):
+        self.df = df.reset_index(drop=True)
+        self.valid = list(range(len(self.df)))
+        print(f"Dataset initialized with {len(self.valid)} patients.")
+
+    def __len__(self):
+        return len(self.valid)
+
+    def __getitem__(self, idx):
+        row = self.df.loc[self.valid[idx]]
+        mrn = str(row[mrn_col])
+
+        t1_path = os.path.join(nifti_root, mrn, "t1.nii.gz")
+        t1 = load_nifti(t1_path)
+        t1 = resize_volume(t1, target_depth, target_height, target_width)
+        img = np.expand_dims(t1, axis=0)  # (1, D, H, W)
+
+        clin = row[clinical_cols].astype(float).values
+        time = float(row[time_col])
+        event = float(row[event_col])
+
+        return (
+            torch.tensor(img).float(),
+            torch.tensor(clin).float(),
+            torch.tensor(time).float(),
+            torch.tensor(event).float()
+        )
+
+
+# -----------------------------
+# LOAD CLINICAL DATA
+# -----------------------------
+df = pd.read_excel(excel_path)
+
+# keep grade 2 and 3 only
+df[grade_col] = pd.to_numeric(df[grade_col], errors="coerce")
+df = df[df[grade_col].isin([2, 3])]
+
+required_cols = [mrn_col] + clinical_cols + [time_col, event_col]
+df = df.dropna(subset=required_cols)
+
+def has_nifti(mrn):
+    return os.path.exists(os.path.join(nifti_root, str(mrn), "t1.nii.gz"))
+
+df = df[df[mrn_col].apply(has_nifti)].reset_index(drop=True)
+print(f"Patients with valid T1 NIfTI files: {len(df)}")
+
+n_patients = len(df)
+
+# -----------------------------
+# SURVIVAL-AWARE STRATIFICATION LABEL
+# -----------------------------
+# Create coarse time bins (quartiles) for stratification
+df["time_bin"] = pd.qcut(df[time_col], q=4, labels=False, duplicates="drop")
+
+# Combine event status and time bin into a single stratification label
+# This keeps both event proportion and early/late events balanced across folds
+y_strat = df[event_col].astype(int).astype(str) + "_" + df["time_bin"].astype(int).astype(str)
+
+# -----------------------------
+# MODEL
+# -----------------------------
+class SurvivalNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # 3D CNN EfficientNet-B0 backbone
+        self.backbone = EfficientNetBN(
+            spatial_dims=3,
+            in_channels=1,
+            model_name="efficientnet-b0",
+            pretrained=False
+        )
+
+        # Freeze early blocks (e.g., blocks 0 and 1)
+        for name, param in self.backbone.named_parameters():
+            if "blocks.0" in name or "blocks.1" in name:
+                param.requires_grad = False
+
+        # Infer feature dimension
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, target_depth, target_height, target_width)
+            feat_dim = self.backbone(dummy).shape[1]
+
+        # Clinical MLP
+        self.clin_mlp = nn.Sequential(
+            nn.Linear(len(clinical_cols), 32),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(32, 32),
+            nn.ReLU(inplace=True),
+        )
+
+        # Fusion head → risk score
+        self.fusion = nn.Sequential(
+            nn.Linear(feat_dim + 32, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, img, clin):
+        feats = self.backbone(img)              # (B, feat_dim)
+        clin_feats = self.clin_mlp(clin)        # (B, 32)
+        x = torch.cat([feats, clin_feats], dim=1)
+        risk = self.fusion(x).squeeze(-1)       # (B,)
+        return risk
+
+
+# -----------------------------
+# COX LOSS + C-INDEX
+# -----------------------------
+def cox_ph_loss(risk, time, event):
+    # Sort by descending time
+    order = torch.argsort(time, descending=True)
+    risk = risk[order]
+    event = event[order]
+
+    log_cum_hazard = torch.logcumsumexp(risk, dim=0)
+    log_likelihood = risk - log_cum_hazard
+    loss = - (log_likelihood * event).sum() / (event.sum() + 1e-8)
+    return loss
+
+
+def concordance_index(risk, time, event):
+    risk = risk.detach().cpu().numpy()
+    time = time.detach().cpu().numpy()
+    event = event.detach().cpu().numpy()
+
+    n = len(time)
+    num = 0.0
+    den = 0.0
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if time[i] == time[j]:
+                continue
+            if event[i] == 0 and event[j] == 0:
+                continue
+
+            if time[i] < time[j]:
+                if event[i] == 0:
+                    continue
+                den += 1
+                if risk[i] > risk[j]:
+                    num += 1
+                elif risk[i] == risk[j]:
+                    num += 0.5
+            else:
+                if event[j] == 0:
+                    continue
+                den += 1
+                if risk[j] > risk[i]:
+                    num += 1
+                elif risk[i] == risk[j]:
+                    num += 0.5
+
+    return num / den if den > 0 else np.nan
+
+
+# -----------------------------
+# FIGURE UTILITIES
+# -----------------------------
+def plot_training_curves(train_losses, val_losses, fold_idx):
+    plt.figure(figsize=(8, 6))
+    plt.plot(train_losses, label="Train Loss", linewidth=2.5)
+    plt.plot(val_losses, label="Validation Loss", linewidth=2.5)
+    plt.xlabel("Epoch")
+    plt.ylabel("Cox Loss")
+    plt.title(f"Training & Validation Loss (Fold {fold_idx + 1})")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"training_loss_fold{fold_idx + 1}.png", dpi=300)
+    plt.close()
+
+
+def plot_cindex_curve(cindex_values, fold_idx):
+    plt.figure(figsize=(8, 6))
+    plt.plot(cindex_values, marker="o", linewidth=2.5)
+    plt.xlabel("Epoch")
+    plt.ylabel("C-index")
+    plt.ylim(0.0, 1.0)
+    plt.title(f"Validation C-index Over Training (Fold {fold_idx + 1})")
+    plt.tight_layout()
+    plt.savefig(f"cindex_fold{fold_idx + 1}.png", dpi=300)
+    plt.close()
+
+
+def plot_cv_summary(cv_cindices):
+    mean_c = np.mean(cv_cindices)
+    std_c = np.std(cv_cindices)
+
+    plt.figure(figsize=(8, 6))
+    sns.barplot(x=list(range(1, len(cv_cindices) + 1)),
+                y=cv_cindices,
+                color="steelblue",
+                edgecolor="black")
+
+    plt.axhline(mean_c, color="red", linestyle="--", linewidth=2,
+                label=f"Mean C-index = {mean_c:.3f}")
+
+    plt.xlabel("Fold")
+    plt.ylabel("C-index")
+    plt.title("Cross-Validation Performance")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("cv_summary.png", dpi=300)
+    plt.close()
+
+
+def plot_km_curves(times, events, risks, outpath="km_curve.png"):
+    times = np.asarray(times)
+    events = np.asarray(events)
+    risks = np.asarray(risks)
+
+    median_risk = np.median(risks)
+    high_mask = risks >= median_risk
+    low_mask = risks < median_risk
+
+    km_high = KaplanMeierFitter()
+    km_low = KaplanMeierFitter()
+
+    plt.figure(figsize=(8, 6))
+
+    km_high.fit(times[high_mask], events[high_mask], label="High Risk")
+    km_low.fit(times[low_mask], events[low_mask], label="Low Risk")
+
+    km_high.plot(ci_show=False, linewidth=2.5, color="red")
+    km_low.plot(ci_show=False, linewidth=2.5, color="blue")
+
+    plt.title("Kaplan–Meier Survival Curves by Predicted Risk (CV OOF)")
+    plt.xlabel("Time")
+    plt.ylabel("Survival Probability")
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+
+
+def plot_mri_three_plane(volume, outpath="mri_panel.png"):
+    """
+    volume: (D, H, W) numpy array
+    """
+    D, H, W = volume.shape
+
+    axial = volume[D // 2, :, :]
+    coronal = volume[:, H // 2, :]
+    sagittal = volume[:, :, W // 2]
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+    axes[0].imshow(axial.T, cmap="gray", origin="lower")
+    axes[0].set_title("Axial")
+    axes[0].axis("off")
+
+    axes[1].imshow(coronal.T, cmap="gray", origin="lower")
+    axes[1].set_title("Coronal")
+    axes[1].axis("off")
+
+    axes[2].imshow(sagittal.T, cmap="gray", origin="lower")
+    axes[2].set_title("Sagittal")
+    axes[2].axis("off")
+
+    plt.tight_layout()
+    plt.savefig(outpath, dpi=300)
+    plt.close()
+
+
+# -----------------------------
+# TRAIN ONE FOLD
+# -----------------------------
+def train_one_fold(train_df, val_df, fold_idx, oof_risk, oof_time, oof_event):
+    print(f"\n========== FOLD {fold_idx + 1} ==========")
+
+    # Standardize clinical features using train statistics only
+    scaler = StandardScaler()
+    scaler.fit(train_df[clinical_cols].astype(float).values)
+
+    train_df_norm = train_df.copy()
+    val_df_norm = val_df.copy()
+    train_df_norm[clinical_cols] = scaler.transform(train_df[clinical_cols])
+    val_df_norm[clinical_cols] = scaler.transform(val_df[clinical_cols])
+
+    train_ds = MeningiomaSurvivalDataset(train_df_norm)
+    val_ds = MeningiomaSurvivalDataset(val_df_norm)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+    model = SurvivalNet().to(device)
+
+    opt = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=learning_rate,
+        weight_decay=weight_decay
+    )
+
+    best_cindex = -np.inf
+    patience_counter = 0
+
+    fold_train_losses = []
+    fold_val_losses = []
+    fold_cindices = []
+
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        train_losses = []
+
+        print(f"\nFold {fold_idx + 1} | Epoch {epoch}/{num_epochs}")
+        for img, clin, time, event in tqdm(train_loader, desc="Training"):
+            img, clin, time, event = img.to(device), clin.to(device), time.to(device), event.to(device)
+
+            opt.zero_grad()
+            risk = model(img, clin)
+            loss = cox_ph_loss(risk, time, event)
+            loss.backward()
+            opt.step()
+
+            train_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        all_risk, all_time, all_event = [], [], []
+
+        with torch.no_grad():
+            for img, clin, time, event in tqdm(val_loader, desc="Validation"):
+                img, clin, time, event = img.to(device), clin.to(device), time.to(device), event.to(device)
+
+                risk = model(img, clin)
+                loss = cox_ph_loss(risk, time, event)
+                val_losses.append(loss.item())
+
+                all_risk.append(risk)
+                all_time.append(time)
+                all_event.append(event)
+
+        all_risk = torch.cat(all_risk)
+        all_time = torch.cat(all_time)
+        all_event = torch.cat(all_event)
+
+        cindex = concordance_index(all_risk, all_time, all_event)
+
+        mean_train_loss = float(np.mean(train_losses))
+        mean_val_loss = float(np.mean(val_losses))
+
+        fold_train_losses.append(mean_train_loss)
+        fold_val_losses.append(mean_val_loss)
+        fold_cindices.append(cindex)
+
+        print(
+            f"Fold {fold_idx + 1} | Train Loss: {mean_train_loss:.4f} | "
+            f"Val Loss: {mean_val_loss:.4f} | C-index: {cindex:.4f}"
+        )
+
+        # Early stopping based on C-index
+        if cindex > best_cindex:
+            best_cindex = cindex
+            patience_counter = 0
+            # Save best model state for this fold (in memory)
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping triggered on fold {fold_idx + 1}")
+            break
+
+    # Plot per-fold curves
+    plot_training_curves(fold_train_losses, fold_val_losses, fold_idx)
+    plot_cindex_curve(fold_cindices, fold_idx)
+
+    # Reload best model state for final OOF predictions
+    model.load_state_dict({k: v.to(device) for k, v in best_state_dict.items()})
+    model.eval()
+
+    # OOF predictions for this fold's validation patients
+    val_ds_full = MeningiomaSurvivalDataset(val_df_norm)
+    val_loader_full = DataLoader(val_ds_full, batch_size=batch_size, shuffle=False)
+
+    all_risk_oof = []
+    with torch.no_grad():
+        for img, clin, time, event in tqdm(val_loader_full, desc="OOF inference"):
+            img, clin = img.to(device), clin.to(device)
+            risk = model(img, clin)
+            all_risk_oof.append(risk.cpu().numpy())
+
+    all_risk_oof = np.concatenate(all_risk_oof, axis=0)
+
+    return best_cindex, all_risk_oof
+
+
+# -----------------------------
+# STRATIFIED 5-FOLD CV + OOF PREDICTIONS
+# -----------------------------
+skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_seed)
+
+fold_cindices = []
+
+# Arrays to store out-of-fold predictions
+oof_risk = np.zeros(n_patients, dtype=np.float32)
+oof_time = df[time_col].values.astype(np.float32)
+oof_event = df[event_col].values.astype(np.float32)
+
+for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, y_strat)):
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    val_df = df.iloc[val_idx].reset_index(drop=True)
+
+    best_c, fold_oof_risk = train_one_fold(train_df, val_df, fold_idx,
+                                           oof_risk, oof_time, oof_event)
+    fold_cindices.append(best_c)
+    print(f"\n>>> Fold {fold_idx + 1} best C-index: {best_c:.4f}")
+
+    # Assign OOF predictions to correct global indices
+    oof_risk[val_idx] = fold_oof_risk
+
+# -----------------------------
+# SUMMARY
+# -----------------------------
+valid_c = [c for c in fold_cindices if not np.isnan(c)]
+print("\n========== CROSS-VALIDATION SUMMARY ==========")
+for i, c in enumerate(valid_c):
+    print(f"Fold {i + 1}: C-index = {c:.4f}")
+
+print(f"\nMean C-index: {np.mean(valid_c):.4f} | Std C-index: {np.std(valid_c):.4f}")
+
+# Plot CV summary figure
+plot_cv_summary(valid_c)
+
+# -----------------------------
+# KAPLAN–MEIER CURVES (OOF PREDICTIONS)
+# -----------------------------
+print("\nGenerating Kaplan–Meier curves from out-of-fold predictions...")
+plot_km_curves(oof_time, oof_event, oof_risk, outpath="km_curve.png")
+print("Saved: km_curve.png")
+
+# -----------------------------
+# MRI 3-PLANE VISUALIZATION (FIRST PATIENT)
+# -----------------------------
+print("\nGenerating MRI 3-plane visualization for first patient...")
+first_row = df.iloc[0]
+first_mrn = str(first_row[mrn_col])
+first_t1_path = os.path.join(nifti_root, first_mrn, "t1.nii.gz")
+first_vol = load_nifti(first_t1_path)
+first_vol_resized = resize_volume(first_vol, target_depth, target_height, target_width)
+plot_mri_three_plane(first_vol_resized, outpath="mri_panel.png")
+print("Saved: mri_panel.png")
+
+print("\nAll done. Figures saved in working directory:")
+print("  - training_loss_foldX.png")
+print("  - cindex_foldX.png")
+print("  - cv_summary.png")
+print("  - km_curve.png")
+print("  - mri_panel.png")
